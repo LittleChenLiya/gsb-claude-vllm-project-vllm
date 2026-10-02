@@ -200,6 +200,14 @@ class RequestState:
             deque() if stream_input else None
         )
 
+        # Per-request monotonic output sequence number. Incremented each time
+        # an incremental output is produced for this request; never regresses.
+        # Used by clients to deduplicate outputs after reconnecting.
+        self.next_output_seq_num = 1
+        # High-water mark of engine-core seq nums already processed for this
+        # request. Used to drop duplicate/out-of-order engine outputs.
+        self.last_engine_seq_num = 0
+
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
         # Apply the update to the request state.
         self.streaming_input = not update.final
@@ -376,6 +384,12 @@ class RequestState:
             prompt_token_ids = [0] * len(self.prompt_embeds)
         assert prompt_token_ids is not None
 
+        # Assign the next per-request monotonic seq num. This is the only
+        # place outputs are created, so every emitted output gets a strictly
+        # increasing seq num that never regresses for this request.
+        seq_num = self.next_output_seq_num
+        self.next_output_seq_num += 1
+
         first_output = outputs[0]
         if isinstance(first_output, PoolingOutput):
             assert len(outputs) == 1
@@ -385,6 +399,7 @@ class RequestState:
                 num_cached_tokens=self.num_cached_tokens,
                 prompt_token_ids=prompt_token_ids,
                 finished=finished,
+                seq_num=seq_num,
             )
         assert self.logprobs_processor is not None
         if self.output_kind == RequestOutputKind.DELTA:
@@ -406,6 +421,7 @@ class RequestState:
             num_cached_tokens=self.num_cached_tokens,
             num_cache_creation_tokens=self.num_cache_creation_tokens,
             metrics=self.stats,
+            seq_num=seq_num,
         )
 
     def _new_completion_output(
@@ -672,6 +688,15 @@ class OutputProcessor:
             if req_state is None:
                 # Ignore output for already-aborted request.
                 continue
+
+            # Duplicate/out-of-order guard: drop any engine output whose
+            # stamped seq num has already been processed for this request.
+            # This keeps the emitted seq num from regressing when the engine
+            # re-delivers (at-least-once transport) or reorders outputs.
+            if engine_core_output.seq_num > 0:
+                if engine_core_output.seq_num <= req_state.last_engine_seq_num:
+                    continue
+                req_state.last_engine_seq_num = engine_core_output.seq_num
 
             # 1) Compute stats for this iteration.
             self._update_stats_from_output(

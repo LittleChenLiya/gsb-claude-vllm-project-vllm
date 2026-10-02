@@ -180,6 +180,11 @@ class Request:
         # deferred block freeing (see Scheduler._free_request_blocks).
         self.last_sched_seq = 0
 
+        # Per-request monotonic output sequence number, stamped on each
+        # EngineCoreOutput produced for this request. Used by the output
+        # processor to detect duplicate/out-of-order deliveries.
+        self.output_seq_num = 0
+
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt

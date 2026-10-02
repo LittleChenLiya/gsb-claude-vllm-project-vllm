@@ -130,6 +130,11 @@ class RequestOutput:
             prefix-cache writes for this request.
         kv_transfer_params: The params for remote K/V transfer.
         ec_transfer_params: The params for remote encoder-cache transfer.
+        seq_num: Per-request monotonic sequence number, incremented for each
+            incremental output produced for this request. Clients can use it
+            to deduplicate outputs after reconnecting (e.g. ignore any output
+            with a seq num already observed for the request). Never regresses
+            for a given request; independent across requests.
 
     """
 
@@ -150,6 +155,7 @@ class RequestOutput:
         *,
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
+        seq_num: int = 0,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -172,12 +178,15 @@ class RequestOutput:
         self.num_cache_creation_tokens = num_cache_creation_tokens
         self.kv_transfer_params = kv_transfer_params
         self.ec_transfer_params = ec_transfer_params
+        self.seq_num = seq_num
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
         self.ec_transfer_params = next_output.ec_transfer_params
+        # Seq nums are monotonic per request; keep the highest (latest).
+        self.seq_num = max(self.seq_num, next_output.seq_num)
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):
@@ -220,7 +229,8 @@ class RequestOutput:
             f"metrics={self.metrics}, "
             f"lora_request={self.lora_request}, "
             f"num_cached_tokens={self.num_cached_tokens}, "
-            f"num_cache_creation_tokens={self.num_cache_creation_tokens})"
+            f"num_cache_creation_tokens={self.num_cache_creation_tokens}, "
+            f"seq_num={self.seq_num})"
         )
 
 
@@ -246,6 +256,10 @@ class PoolingRequestOutput(Generic[_O]):
         prompt_token_ids (list[int]): A list of token IDs used in the prompt.
         num_cached_tokens: The number of tokens with prefix cache hit.
         finished (bool): A flag indicating whether the pooling is completed.
+        seq_num: Per-request monotonic sequence number, incremented for each
+            incremental output produced for this request. Clients can use it
+            to deduplicate outputs after reconnecting. Never regresses for a
+            given request; independent across requests.
 
     """
 
@@ -256,12 +270,14 @@ class PoolingRequestOutput(Generic[_O]):
         prompt_token_ids: list[int],
         num_cached_tokens: int,
         finished: bool,
+        seq_num: int = 0,
     ):
         self.request_id = request_id
         self.prompt_token_ids = prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.finished = finished
         self.outputs = outputs
+        self.seq_num = seq_num
 
     def __repr__(self) -> str:
         return (
@@ -269,7 +285,8 @@ class PoolingRequestOutput(Generic[_O]):
             f"outputs={self.outputs!r}, "
             f"prompt_token_ids={self.prompt_token_ids}, "
             f"num_cached_tokens={self.num_cached_tokens}, "
-            f"finished={self.finished})"
+            f"finished={self.finished}, "
+            f"seq_num={self.seq_num})"
         )
 
 

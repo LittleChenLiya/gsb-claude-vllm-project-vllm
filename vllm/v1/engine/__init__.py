@@ -236,6 +236,13 @@ class EngineCoreOutput(
     # Appended last so `array_like` positional serialization stays compatible.
     spec_decode_metrics: RequestSpecDecodeMetrics | None = None
 
+    # Per-request monotonic sequence number stamped by the engine core.
+    # The output processor uses it to detect duplicate/out-of-order deliveries
+    # (at-least-once transport): any output whose seq num has already been
+    # processed for that request is dropped. 0 means unstamped (backward
+    # compatible); the output processor then falls back to an internal counter.
+    seq_num: int = 0
+
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None

@@ -2195,6 +2195,9 @@ class Scheduler(SchedulerInterface):
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if should_emit_output:
+                # Stamp a per-request monotonic seq num so the output
+                # processor can detect duplicate/out-of-order deliveries.
+                request.output_seq_num += 1
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
@@ -2218,6 +2221,7 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        seq_num=request.output_seq_num,
                     )
                 )
             else:
