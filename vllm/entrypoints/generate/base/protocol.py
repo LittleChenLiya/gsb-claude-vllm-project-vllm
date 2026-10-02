@@ -266,6 +266,12 @@ def validate_structured_outputs_structural_tag(
 class StreamOptions(OpenAIBaseModel):
     include_usage: bool | None = False
     continuous_usage_stats: bool | None = False
+    # vLLM extension (not part of the OpenAI spec): when true, the stream
+    # ends with one extra terminal chunk carrying a top-level
+    # ``termination_reason`` field ("stop", "client_cancelled" or
+    # "server_timeout") right before ``data: [DONE]``. Defaults to false so
+    # the response schema is unchanged unless explicitly requested.
+    include_termination_reason: bool | None = False
 
 
 class FunctionDefinition(OpenAIBaseModel):

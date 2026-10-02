@@ -20,6 +20,10 @@ from vllm.entrypoints.serve.utils.api_utils import (
 )
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.sse_keep_alive import with_sse_keep_alive
+from vllm.entrypoints.serve.utils.stream_termination import (
+    StreamTerminationState,
+    with_stream_termination,
+)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -66,8 +70,21 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 
     args = getattr(raw_request.app.state, "args", None)
     keep_alive_interval = getattr(args, "sse_keep_alive_interval", 0)
+    stream_timeout = float(getattr(args, "stream_timeout", 0) or 0)
+    stream_options = request.stream_options
+    termination_state = StreamTerminationState()
+    # Exposed for middleware / background tasks / tests that want to know
+    # how the stream ended ("stop", "client_cancelled", "server_timeout").
+    raw_request.state.stream_termination = termination_state
     return StreamingResponse(
-        content=with_sse_keep_alive(generator, float(keep_alive_interval)),
+        content=with_stream_termination(
+            with_sse_keep_alive(generator, float(keep_alive_interval)),
+            state=termination_state,
+            timeout=stream_timeout if stream_timeout > 0 else None,
+            include_termination_reason=bool(
+                stream_options and stream_options.include_termination_reason
+            ),
+        ),
         media_type="text/event-stream",
     )
 

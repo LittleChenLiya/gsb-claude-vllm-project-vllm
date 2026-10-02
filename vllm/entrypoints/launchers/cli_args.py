@@ -157,6 +157,15 @@ class BaseFrontendArgs:
     with read timeouts from closing the connection. Defaults to 0, which
     disables keep-alive comments entirely.
     """
+    stream_timeout: float = 0
+    """If positive, terminate `/v1/chat/completions` and `/v1/completions`
+    streaming responses that run longer than this many seconds. The upstream
+    request is aborted (resources released) and the stream ends with a
+    terminal chunk carrying `termination_reason: "server_timeout"` (when the
+    client opted in via `stream_options.include_termination_reason`) followed
+    by `data: [DONE]`. Defaults to 0, which disables the server-side stream
+    timeout.
+    """
     enable_tokenizer_info_endpoint: bool = False
     """Enable the `/tokenizer_info` endpoint. May expose chat
     templates and other tokenizer configuration."""
@@ -475,6 +484,13 @@ def validate_parsed_serve_args(args: argparse.Namespace):
         raise ValueError(
             "Error: --sse-keep-alive-interval must be a non-negative integer "
             "(0 disables keep-alive comments)."
+        )
+
+    # Stream timeout must be zero (disabled) or a positive number of seconds.
+    if getattr(args, "stream_timeout", 0) < 0:
+        raise ValueError(
+            "Error: --stream-timeout must be a non-negative number of seconds "
+            "(0 disables the server-side stream timeout)."
         )
 
     if getattr(args, "enable_per_request_metrics", False) and getattr(

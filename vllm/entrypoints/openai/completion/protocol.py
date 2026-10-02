@@ -688,3 +688,9 @@ class CompletionStreamResponse(OpenAIBaseModel):
     # without the per-chunk serialization overhead.
     system_fingerprint: str | None = None
     metrics: PerRequestMetrics | None = None
+    # vLLM extension (not part of the OpenAI spec): set only on the extra
+    # terminal chunk emitted when the request opts in via
+    # ``stream_options.include_termination_reason``. One of "stop",
+    # "client_cancelled" or "server_timeout". Never set otherwise, so the
+    # default response schema is unchanged.
+    termination_reason: str | None = None
