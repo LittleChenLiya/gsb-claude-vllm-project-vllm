@@ -479,6 +479,11 @@ class OutputProcessor:
         self.request_states: dict[str, RequestState] = {}
         self.parent_requests: dict[str, ParentRequest] = {}
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
+        # Per-external-request monotonic counters used to number every
+        # emitted RequestOutput (``output_seq``). Clients use the numbers to
+        # deduplicate replayed/redelivered deltas after a reconnect. Counters
+        # are independent per request and start at 1.
+        self.output_seq_counters: dict[str, int] = {}
         self.lora_states = LoRARequestStates(log_stats)
         self.tracing_enabled = tracing_enabled
         self.admission_stats = admission_stats
@@ -525,6 +530,9 @@ class OutputProcessor:
         also.
         """
         internal_req_ids = []
+        # External request ids touched by this abort call; their sequence
+        # counters are released once every final abort output is stamped.
+        touched_external_ids: set[str] = set()
         for request_id in request_ids:
             if internal:
                 # Internal ID - this may be a parent request
@@ -533,12 +541,14 @@ class OutputProcessor:
                 # Remove internal ID from the external->internal mapping
                 if req_state := self.request_states.get(request_id):
                     external_req_id = req_state.external_req_id
+                    touched_external_ids.add(external_req_id)
                     internal_ids = self.external_req_ids[external_req_id]
                     internal_ids.remove(request_id)
                     if not internal_ids:
                         del self.external_req_ids[external_req_id]
             elif internal_ids := self.external_req_ids.pop(request_id, []):
                 # External ID - abort all requests in the external->internal mapping
+                touched_external_ids.add(request_id)
                 internal_req_ids.extend(internal_ids)
 
         request_ids_to_abort = []
@@ -562,6 +572,10 @@ class OutputProcessor:
                         ec_transfer_params=None,
                     )
                 ):
+                    if isinstance(request_output, RequestOutput):
+                        self._assign_output_seq(
+                            request_output, req_state.external_req_id
+                        )
                     req_state.queue.put(request_output)
             elif parent := self.parent_requests.get(request_id):
                 # Abort children prior to removing the parent.
@@ -570,6 +584,13 @@ class OutputProcessor:
                     child_reqs = self.abort_requests(child_reqs, internal=True)
                     request_ids_to_abort.extend(child_reqs)
                 self.parent_requests.pop(request_id, None)
+
+        # Final abort outputs have been stamped above; release the sequence
+        # counters of external requests with no remaining sub-requests.
+        for external_req_id in touched_external_ids:
+            if external_req_id not in self.external_req_ids:
+                self._release_output_seq(external_req_id)
+
         self._update_admission_stats()
         return request_ids_to_abort
 
@@ -735,6 +756,10 @@ class OutputProcessor:
                 if req_state.streaming_input:
                     request_output.finished = False
 
+                # Stamp the per-request monotonic dedup sequence number.
+                if isinstance(request_output, RequestOutput):
+                    self._assign_output_seq(request_output, req_state.external_req_id)
+
                 if req_state.queue is not None:
                     # AsyncLLM: put into queue for handling by generate().
                     req_state.queue.put(request_output)
@@ -769,6 +794,46 @@ class OutputProcessor:
             reqs_to_abort=reqs_to_abort,
         )
 
+    def _assign_output_seq(
+        self, request_output: RequestOutput, external_req_id: str
+    ) -> None:
+        """Stamp ``request_output`` with the next dedup sequence number.
+
+        Sequence numbers are:
+
+        * scoped per external request (each request starts at 1 and counts
+          independently);
+        * strictly increasing (a number is never reused for a newer output),
+          so a reconnecting client can drop a redelivered delta whenever its
+          sequence number is <= the last number already applied;
+        * present on every emitted output, including the terminal finished
+          output and abort output.
+
+        The monotonicity invariant is guarded at this emission point: a
+        previously-stamped output carrying a smaller number than the last
+        number emitted for the same request indicates a reordering bug and
+        fails loudly. (When the async collector coalesces several outputs it
+        independently keeps the highest number, see RequestOutput.add.)
+        """
+        last_seq = self.output_seq_counters.get(external_req_id, 0)
+        if request_output.output_seq is not None:
+            # Defensive: every emitted output is stamped exactly once.
+            assert request_output.output_seq > last_seq, (
+                f"Output sequence number for request {external_req_id!r} "
+                f"regressed: attempted to emit output_seq="
+                f"{request_output.output_seq} after {last_seq} was already "
+                "emitted."
+            )
+            next_seq = request_output.output_seq
+        else:
+            next_seq = last_seq + 1
+            request_output.output_seq = next_seq
+        self.output_seq_counters[external_req_id] = next_seq
+
+    def _release_output_seq(self, external_req_id: str) -> None:
+        """Forget the sequence counter of a completed external request."""
+        self.output_seq_counters.pop(external_req_id, None)
+
     def _finish_request(self, req_state: RequestState) -> None:
         req_id = req_state.request_id
         self.request_states.pop(req_id)
@@ -777,6 +842,10 @@ class OutputProcessor:
         internal_ids.remove(req_id)
         if not internal_ids:
             del self.external_req_ids[req_state.external_req_id]
+            # All sub-requests for this client-visible request are gone; drop
+            # its sequence counter so a later, unrelated request that reuses
+            # the same external id restarts numbering at 1.
+            self._release_output_seq(req_state.external_req_id)
 
         # Remove parent request if applicable.
         parent_req = req_state.parent_req

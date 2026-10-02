@@ -128,6 +128,15 @@ class RequestOutput:
         num_cached_tokens: The number of tokens with prefix cache hit.
         num_cache_creation_tokens: Prompt tokens currently counted as local
             prefix-cache writes for this request.
+        output_seq: Monotonic 1-based sequence number of this output within the
+            request. Each emitted output (including the terminal, finished
+            output) carries the next sequence number. A client that
+            reconnects after a dropped connection can drop duplicate and
+            replayed deltas by tracking the highest sequence number it has
+            already applied. Sequence numbers are scoped to the request: they
+            restart at 1 for every request and are independent across
+            requests. ``None`` for outputs produced before/without sequence
+            numbering (e.g. the STREAM_FINISHED sentinel).
         kv_transfer_params: The params for remote K/V transfer.
         ec_transfer_params: The params for remote encoder-cache transfer.
 
@@ -147,6 +156,7 @@ class RequestOutput:
         encoder_prompt_token_ids: list[int] | None = None,
         num_cached_tokens: int | None = None,
         num_cache_creation_tokens: int | None = None,
+        output_seq: int | None = None,
         *,
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
@@ -170,6 +180,7 @@ class RequestOutput:
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.num_cache_creation_tokens = num_cache_creation_tokens
+        self.output_seq = output_seq
         self.kv_transfer_params = kv_transfer_params
         self.ec_transfer_params = ec_transfer_params
 
@@ -178,6 +189,17 @@ class RequestOutput:
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
         self.ec_transfer_params = next_output.ec_transfer_params
+
+        # Merge dedup sequence numbers: the merged output represents the
+        # newest data seen, so it always carries the highest sequence number.
+        # Taking the max (rather than overwriting) also makes coalescing
+        # order-independent: when the producer outruns the consumer, older
+        # outputs may be merged into newer ones and vice versa, but the
+        # sequence of a request must never go backwards as a result.
+        if next_output.output_seq is not None and (
+            self.output_seq is None or next_output.output_seq > self.output_seq
+        ):
+            self.output_seq = next_output.output_seq
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):
@@ -220,7 +242,8 @@ class RequestOutput:
             f"metrics={self.metrics}, "
             f"lora_request={self.lora_request}, "
             f"num_cached_tokens={self.num_cached_tokens}, "
-            f"num_cache_creation_tokens={self.num_cache_creation_tokens})"
+            f"num_cache_creation_tokens={self.num_cache_creation_tokens}, "
+            f"output_seq={self.output_seq})"
         )
 
 
