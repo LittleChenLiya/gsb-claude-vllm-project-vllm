@@ -1656,10 +1656,11 @@ def test_free_cow_retained_blocks_defers_until_copy_step_processed():
     )
     free = Scheduler._free_cow_retained_blocks
 
-    # Copy step still in flight: deferred with its fence.
+    # Copy step still in flight: deferred with its fence. CoW retentions are
+    # not attributable to a single request, hence request_id=None provenance.
     free(mock, list(blocks), fence_seq=3)
     assert not freed
-    assert mock.deferred_frees == deque([(3, blocks[::-1])])
+    assert mock.deferred_frees == deque([(3, blocks[::-1], None)])
 
     # Copy step processed: freed immediately.
     mock.processed_step_seq = 3

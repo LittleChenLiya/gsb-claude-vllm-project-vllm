@@ -192,6 +192,15 @@ class KVCacheBlock:
     # the full block boundary; partial entries can end inside a cache block.
     _block_hash_num_tokens: int | None = None
 
+    # Read-only provenance for eviction explanations: the request that last
+    # held (part of) a reference to this block. It is stamped on every release
+    # of a reference, so when a cached block becomes evictable (ref_cnt == 0)
+    # and is later evicted, an explanation can name its last referrer even
+    # though the block's hash metadata is gone by then. Only primitive data
+    # (a request ID string) is retained: never a reference to a request or
+    # any other object whose lifetime is tied to the freed block.
+    last_request_id: str | None = None
+
     # Used to construct a doubly linked list for free blocks.
     # These two attributes should only be manipulated by FreeKVCacheBlockQueue.
     prev_free_block: "KVCacheBlock | None" = None

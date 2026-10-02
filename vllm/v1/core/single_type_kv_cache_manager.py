@@ -356,7 +356,9 @@ class SingleTypeKVCacheManager(ABC):
         num_new_blocks = max(
             0, cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
         )
-        allocated_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+        allocated_blocks = self.block_pool.get_new_blocks(
+            num_new_blocks, request_id=request_id
+        )
         req_blocks.extend(allocated_blocks)
         if self._record_new_block_ids:
             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
@@ -386,7 +388,7 @@ class SingleTypeKVCacheManager(ABC):
             # correct; the extra block was reserved by
             # get_num_blocks_to_allocate.
             block_idx, source_block = self._partial_hit_reqs.pop(request_id)
-            cow_block = self.block_pool.get_new_blocks(1)[0]
+            cow_block = self.block_pool.get_new_blocks(1, request_id=request_id)[0]
             self._apply_cow(request_id, block_idx, source_block, cow_block)
             self.new_block_ids.append(cow_block.block_id)
             cow_blocks.append(cow_block)
@@ -397,7 +399,9 @@ class SingleTypeKVCacheManager(ABC):
         if num_new_blocks <= 0:
             return cow_blocks
         else:
-            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+            new_blocks = self.block_pool.get_new_blocks(
+                num_new_blocks, request_id=request_id
+            )
             req_blocks.extend(new_blocks)
             if self._record_new_block_ids:
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
@@ -581,7 +585,10 @@ class SingleTypeKVCacheManager(ABC):
 
         """
         # Free blocks in reverse order so that the tail blocks are freed first.
-        self.block_pool.free_blocks(reversed(self.pop_blocks_for_free(request_id)))
+        self.block_pool.free_blocks(
+            reversed(self.pop_blocks_for_free(request_id)),
+            request_id=request_id,
+        )
 
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
@@ -677,7 +684,7 @@ class SingleTypeKVCacheManager(ABC):
             freed.append(blocks[i])
             blocks[i] = self._null_block
         if freed:
-            self.block_pool.free_blocks(freed)
+            self.block_pool.free_blocks(freed, request_id=request_id)
 
     def remove_skipped_blocks(
         self,
@@ -1200,7 +1207,7 @@ class CircularBufferManager(FullAttentionManager):
         req_blocks = self.req_to_blocks[request_id]
         if req_blocks:
             return []
-        new_blocks = self.block_pool.get_new_blocks(1)
+        new_blocks = self.block_pool.get_new_blocks(1, request_id=request_id)
         req_blocks.extend(new_blocks)
         if self._record_new_block_ids:
             self.new_block_ids.extend(block.block_id for block in new_blocks)
@@ -1635,7 +1642,7 @@ class MambaManager(SingleTypeKVCacheManager):
             freed.append(blocks[i])
             blocks[i] = self._null_block
         if freed:
-            self.block_pool.free_blocks(freed)
+            self.block_pool.free_blocks(freed, request_id=request_id)
         self._num_retired_blocks[request_id] = last_block
 
     def remove_skipped_blocks(
@@ -1665,7 +1672,10 @@ class MambaManager(SingleTypeKVCacheManager):
             ):
                 blocks = self.req_to_blocks[request_id]
                 if blocks[last_state_block_idx] != self._null_block:
-                    self.block_pool.free_blocks([blocks[last_state_block_idx]])
+                    self.block_pool.free_blocks(
+                        [blocks[last_state_block_idx]],
+                        request_id=request_id,
+                    )
                     blocks[last_state_block_idx] = self._null_block
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
@@ -1879,7 +1889,9 @@ class MambaManager(SingleTypeKVCacheManager):
                 if not blocks_allocated or checkpoint_block:
                     max_new_blocks += self.num_speculative_blocks
                 assert num_new_blocks <= max_new_blocks
-                new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+                new_blocks = self.block_pool.get_new_blocks(
+                    num_new_blocks, request_id=request_id
+                )
                 returned_blocks = req_blocks[prev_block_len:]
                 if partial_hit is not None:
                     block_idx, source_block = partial_hit
@@ -2469,7 +2481,9 @@ class HiSparseHotManager(_HiSparseAuxiliaryManager):
         num_new_blocks = self.blocks_per_request - len(req_blocks)
         if num_new_blocks <= 0:
             return []
-        new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+        new_blocks = self.block_pool.get_new_blocks(
+            num_new_blocks, request_id=request_id
+        )
         req_blocks.extend(new_blocks)
         return new_blocks
 
@@ -2524,7 +2538,9 @@ class HiSparseResidentManager(_HiSparseAuxiliaryManager):
         if len(blocks) <= tail_page:
             blocks.extend([self._null_block] * (tail_page + 1 - len(blocks)))
         if blocks[tail_page].is_null:
-            blocks[tail_page] = self.block_pool.get_new_blocks(1)[0]
+            blocks[tail_page] = self.block_pool.get_new_blocks(
+                1, request_id=request_id
+            )[0]
 
     def add_local_computed_blocks(
         self,
@@ -2562,7 +2578,9 @@ class HiSparseResidentManager(_HiSparseAuxiliaryManager):
         num_new_blocks = cdiv(num_tokens, self.block_size) - len(req_blocks)
         if num_new_blocks <= 0:
             return []
-        new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+        new_blocks = self.block_pool.get_new_blocks(
+            num_new_blocks, request_id=request_id
+        )
         req_blocks.extend(new_blocks)
         return new_blocks
 

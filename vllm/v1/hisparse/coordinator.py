@@ -337,7 +337,11 @@ class HiSparseCoordinator:
             return False
         for manager, block in zip(self.resident_managers, blocks):
             self._owners.setdefault(block.block_id, set()).add((request_id, page_idx))
-            manager.block_pool.unpin_blocks([block], self._on_block_reused)
+            manager.block_pool.unpin_blocks(
+                [block],
+                self._on_block_reused,
+                request_id=request_id,
+            )
         state.pinned_clean.discard(page_idx)
         state.unpinned_pages.add(page_idx)
         return True
@@ -750,7 +754,11 @@ class HiSparseCoordinator:
                     page_idx in state.valid_pages
                     and page_idx not in state.pending_pages
                 ):
-                    manager.block_pool.unpin_blocks([block], self._on_block_reused)
+                    manager.block_pool.unpin_blocks(
+                        [block],
+                        self._on_block_reused,
+                        request_id=request_id,
+                    )
                 else:
                     continue
                 blocks[page_idx] = manager._null_block

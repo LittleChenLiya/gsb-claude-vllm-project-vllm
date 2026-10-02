@@ -385,9 +385,11 @@ class Scheduler(SchedulerInterface):
         # is called once per scheduled step in FIFO order, so these stay in sync.
         self.sched_step_seq = 0
         self.processed_step_seq = 0
-        # FIFO of (fence_seq, blocks): blocks become safe to free once
-        # processed_step_seq >= fence_seq.
-        self.deferred_frees: deque[tuple[int, list[KVCacheBlock]]] = deque()
+        # FIFO of (fence_seq, blocks, request_id): blocks become safe to free
+        # once processed_step_seq >= fence_seq. ``request_id`` is optional
+        # provenance for eviction explanations (None for CoW retentions that
+        # are not attributable to a single request).
+        self.deferred_frees: deque[tuple[int, list[KVCacheBlock], str | None]] = deque()
 
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -2685,7 +2687,9 @@ class Scheduler(SchedulerInterface):
             return
         blocks = self.kv_cache_manager.pop_blocks_for_free(request)
         if blocks:
-            self.deferred_frees.append((self.sched_step_seq, blocks))
+            self.deferred_frees.append(
+                (self.sched_step_seq, blocks, request.request_id)
+            )
 
     def _free_cow_retained_blocks(
         self, blocks: list[KVCacheBlock], fence_seq: int
@@ -2696,7 +2700,7 @@ class Scheduler(SchedulerInterface):
         if not self.defer_block_free or fence_seq <= self.processed_step_seq:
             self.kv_cache_manager.block_pool.free_blocks(blocks)
             return
-        self.deferred_frees.append((fence_seq, blocks[::-1]))
+        self.deferred_frees.append((fence_seq, blocks[::-1], None))
 
     def _drain_deferred_frees(self):
         """Return deferred blocks whose fence step has completed.
@@ -2706,12 +2710,14 @@ class Scheduler(SchedulerInterface):
         pending one; any satisfied entry behind it is merely freed later.
         """
         while self.deferred_frees:
-            fence, _ = self.deferred_frees[0]
+            fence, _, _ = self.deferred_frees[0]
             if fence > self.processed_step_seq:
                 break
-            _, blocks = self.deferred_frees.popleft()
+            _, blocks, request_id = self.deferred_frees.popleft()
             # Free in reverse order so that the tail blocks are evicted first.
-            self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+            self.kv_cache_manager.block_pool.free_blocks(
+                reversed(blocks), request_id=request_id
+            )
 
     def get_num_unfinished_requests(self) -> int:
         if self._pause_state == PauseState.PAUSED_ALL:

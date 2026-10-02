@@ -9,6 +9,12 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.block_pool import (
+    EvictedBlockInfo as EvictedBlockInfo,
+)
+from vllm.v1.core.block_pool import (
+    EvictionEvent as EvictionEvent,
+)
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
@@ -655,6 +661,9 @@ class KVCacheManager:
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
 
+        Read-only explanations for the resulting evictions (including each
+        block's last referrer) are drained via :meth:`take_eviction_events`.
+
         Args:
             block_ids: Set of block IDs to evict from cache.
 
@@ -739,6 +748,30 @@ class KVCacheManager:
             event.kv_cache_spec_kind = kind
             event.kv_cache_spec_sliding_window = sliding_window
         return events
+
+    def take_eviction_events(self) -> list[EvictionEvent]:
+        """Drain read-only KV-cache eviction explanations.
+
+        Each :class:`EvictionEvent` explains one eviction trigger (allocation
+        pressure or an explicit :meth:`evict_blocks` call) and lists the
+        cached blocks removed, each with the request that last referenced it.
+
+        Boundary guarantees:
+            - Explanations are immutable snapshots of primitive data. Holders
+              must not keep (or resolve) references to the released blocks; a
+              listed block may already be allocated to another request.
+            - A pure prefix-cache hit path (``get_computed_blocks`` + the
+              ``touch`` it induces) never allocates and therefore never
+              produces an eviction event.
+            - A full :meth:`reset_prefix_cache` is a bulk invalidation, not an
+              eviction, and is not reported here (it emits
+              ``AllBlocksCleared`` via :meth:`take_events` instead).
+
+        Returns:
+            The eviction events recorded since the previous call.
+
+        """
+        return self.block_pool.take_eviction_events()
 
     def get_blocks(self, request_id: str) -> KVCacheBlocks:
         """Get the blocks of a request."""

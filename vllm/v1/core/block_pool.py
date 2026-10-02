@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -132,6 +133,84 @@ class BlockHashToBlockMap:
         raise AssertionError(f"Invalid KV cache block type {type(blocks)}")
 
 
+# Why a block was removed from the prefix cache.
+EVICTION_REASON_ALLOCATION = "allocation"
+EVICTION_REASON_EXPLICIT = "explicit_eviction"
+
+
+@dataclass(frozen=True)
+class EvictedBlockInfo:
+    """Read-only snapshot describing one block evicted from the prefix cache.
+
+    The snapshot deliberately contains only primitive data (IDs, hashes)
+    captured *before* the block's metadata was torn down. It never holds a
+    reference to the evicted :class:`KVCacheBlock` or to the request that
+    last referenced it: after eviction that block may be handed out to
+    another request and overwritten, so consumers of an explanation must not
+    resolve ``block_id`` against the live pool either.
+    """
+
+    block_id: int
+    """ID of the evicted physical block."""
+
+    block_hash: bytes | None
+    """Primary prefix-cache hash the block was reachable under, if any."""
+
+    extra_block_hashes: tuple[bytes, ...] = ()
+    """Additional (e.g. partial/fine-grained) hashes that pointed at it."""
+
+    group_id: int | None = None
+    """KV cache group the cached entry belonged to."""
+
+    num_hash_tokens: int | None = None
+    """Number of prefix tokens covered by ``block_hash``."""
+
+    last_request_id: str | None = None
+    """The request that last referenced the block before it became an
+    eviction candidate. ``None`` if no release attribution was available
+    (e.g. a deferred free with no owning request)."""
+
+
+@dataclass(frozen=True)
+class EvictionEvent:
+    """Read-only explanation of one eviction trigger.
+
+    A single trigger (a block allocation, or an explicit
+    :meth:`BlockPool.evict_blocks` call) may remove several cached blocks.
+    Each is detailed in :attr:`blocks`, with :attr:`last_request_id` naming
+    the request whose new block demand caused the eviction (``None`` for
+    explicit evictions).
+    """
+
+    reason: str
+    """Why the eviction happened (``EVICTION_REASON_*``)."""
+
+    blocks: tuple[EvictedBlockInfo, ...]
+    """Blocks removed from the prefix cache, in eviction order."""
+
+    request_id: str | None = None
+    """The request responsible for the trigger, when known."""
+
+    @property
+    def block_ids(self) -> tuple[int, ...]:
+        return tuple(b.block_id for b in self.blocks)
+
+    def format(self) -> str:
+        """Human-readable one-line explanation of the eviction."""
+        details = ", ".join(
+            f"block {b.block_id}"
+            + (f" (last ref: {b.last_request_id})" if b.last_request_id else "")
+            for b in self.blocks
+        )
+        if self.reason == EVICTION_REASON_ALLOCATION:
+            who = f" by request {self.request_id}" if self.request_id else ""
+            return (
+                f"Evicted {len(self.blocks)} cached block(s) to make room"
+                f"{who}: {details}"
+            )
+        return f"Explicit eviction of {len(self.blocks)} cached block(s): {details}"
+
+
 class BlockPool:
     """BlockPool that manages KVCacheBlocks.
     It provides methods to allocate, free and cache the kv cache blocks. The
@@ -188,6 +267,19 @@ class BlockPool:
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
+
+        # Read-only eviction explanations. Independent of
+        # ``enable_kv_cache_events`` (which controls the external KV-event
+        # protocol): eviction explanations are an always-on local diagnostic.
+        self.eviction_events: list[EvictionEvent] = []
+        # Attribution for evictions caused by the allocation currently in
+        # progress: (reason, requesting request_id). ``None`` outside an
+        # evicting operation, and never populated by the cache-hit path
+        # (``get_cached_block`` / ``touch`` allocate nothing).
+        self._pending_eviction: tuple[str, str | None] | None = None
+        # Collected (block_id -> EvictedBlockInfo) for the current trigger;
+        # the dict both de-duplicates and preserves insertion order.
+        self._pending_evicted_blocks: dict[int, EvictedBlockInfo] = {}
 
         self.metrics_collector = metrics_collector
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
@@ -665,13 +757,25 @@ class BlockPool:
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
 
-    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+    def get_new_blocks(
+        self,
+        num_blocks: int,
+        request_id: str | None = None,
+    ) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
         Note that we do not check block cache in this function.
 
+        When prefix caching is enabled, the blocks popped from the free queue
+        may still carry cached hashes, which are evicted here; a read-only
+        :class:`EvictionEvent` explaining the eviction (evicted blocks and
+        their last referrers) is recorded for every such trigger.
+
         Args:
             num_blocks: The number of blocks to allocate.
+            request_id: The request on whose behalf the allocation happens.
+                Used only for eviction attribution; it does not change
+                allocation behavior.
 
         Returns:
             A list of new block.
@@ -685,21 +789,63 @@ class BlockPool:
         if self._reuse_watchers:
             self._notify_reuse(ret)
 
-        # In order to only iterate the list once, we duplicated code a bit
-        if self.enable_caching:
-            for block in ret:
-                self._maybe_evict_cached_block(block)
-                assert block.ref_cnt == 0
-                block.ref_cnt += 1
-                if self.metrics_collector:
-                    self.metrics_collector.on_block_allocated(block)
-        else:
-            for block in ret:
-                assert block.ref_cnt == 0
-                block.ref_cnt += 1
-                if self.metrics_collector:
-                    self.metrics_collector.on_block_allocated(block)
+        # Attribution scope for any prefix-cache evictions performed below.
+        # The cache-hit path (get_cached_block / touch) never reaches here,
+        # so a successful prefix hit cannot record an eviction event.
+        assert self._pending_eviction is None
+        self._pending_eviction = (EVICTION_REASON_ALLOCATION, request_id)
+        self._pending_evicted_blocks = {}
+        try:
+            # In order to only iterate the list once, we duplicated code a bit
+            if self.enable_caching:
+                for block in ret:
+                    self._maybe_evict_cached_block(block)
+                    assert block.ref_cnt == 0
+                    block.ref_cnt += 1
+                    # The allocating request now owns the block; stamp it so
+                    # later releases keep provenance moving with ownership.
+                    block.last_request_id = request_id
+                    if self.metrics_collector:
+                        self.metrics_collector.on_block_allocated(block)
+            else:
+                for block in ret:
+                    assert block.ref_cnt == 0
+                    block.ref_cnt += 1
+                    block.last_request_id = request_id
+                    if self.metrics_collector:
+                        self.metrics_collector.on_block_allocated(block)
+        finally:
+            self._finish_eviction_event()
         return ret
+
+    def _finish_eviction_event(self) -> None:
+        """Close the current attribution scope and enqueue an explanation."""
+        pending = self._pending_eviction
+        evicted = self._pending_evicted_blocks
+        self._pending_eviction = None
+        self._pending_evicted_blocks = {}
+        if pending is not None and evicted:
+            reason, request_id = pending
+            self.eviction_events.append(
+                EvictionEvent(
+                    reason=reason,
+                    blocks=tuple(evicted.values()),
+                    request_id=request_id,
+                )
+            )
+
+    def take_eviction_events(self) -> list[EvictionEvent]:
+        """Atomically take and clear recorded eviction explanations.
+
+        Returns:
+            A list of :class:`EvictionEvent` recorded since the last call.
+            Empty when no prefix-cache eviction occurred (in particular, a
+            pure cache hit records nothing).
+
+        """
+        events = self.eviction_events
+        self.eviction_events = []
+        return events
 
     def _notify_reuse(self, blocks: Iterable[KVCacheBlock]) -> None:
         for block in blocks:
@@ -711,6 +857,7 @@ class BlockPool:
         self,
         blocks: Iterable[KVCacheBlock],
         on_reuse: Callable[[KVCacheBlock], None],
+        request_id: str | None = None,
     ) -> None:
         """Release references to blocks that stay readable until reused.
 
@@ -718,15 +865,42 @@ class BlockPool:
         caching: they join the tail of the free queue and count as free.
         ``on_reuse`` fires when ``get_new_blocks`` hands a block out (or the
         cache is reset), so the caller can stop reading it.
+
+        ``request_id`` attributes provenance only: the unpinned block's
+        ``last_request_id`` is stamped so a later eviction explanation names
+        this request as its last referrer.
         """
         released: list[KVCacheBlock] = []
         for block in blocks:
             assert block.ref_cnt > 0 and not block.is_null
             block.ref_cnt -= 1
+            if request_id is not None:
+                block.last_request_id = request_id
             self._reuse_watchers[block.block_id] = on_reuse
             if block.ref_cnt == 0:
                 released.append(block)
         self.free_block_queue.append_n(released)
+
+    def _snapshot_evicted_block(self, block: KVCacheBlock) -> EvictedBlockInfo:
+        """Capture a read-only explanation of ``block`` before its hash
+        metadata is torn down. Only primitive data is copied — never the block
+        or request object, so the snapshot stays valid (and safe to hold)
+        after the block is reused."""
+        hashes: list[BlockHashWithGroupId] = []
+        if block.block_hash is not None:
+            hashes.append(block.block_hash)
+        hashes.extend(self.cached_block_hashes_by_block.get(block.block_id, ()))
+        primary = hashes[0] if hashes else None
+        return EvictedBlockInfo(
+            block_id=block.block_id,
+            block_hash=(
+                bytes(get_block_hash(primary)) if primary is not None else None
+            ),
+            extra_block_hashes=tuple(bytes(get_block_hash(h)) for h in hashes[1:]),
+            group_id=get_group_id(primary) if primary is not None else None,
+            num_hash_tokens=block.block_hash_num_tokens,
+            last_request_id=block.last_request_id,
+        )
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """If a block is cached in `cached_block_hash_to_block`, we reset its hash
@@ -743,12 +917,35 @@ class BlockPool:
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
 
+        # Snapshot provenance before _remove_cached_block_hashes resets the
+        # block's hash metadata.
+        had_hash = (
+            block.block_hash is not None
+            or block.block_id in self.cached_block_hashes_by_block
+        )
+        info = self._snapshot_evicted_block(block) if had_hash else None
+
         evicted_hashes = self._remove_cached_block_hashes(block)
         if not evicted_hashes:
             # The block doesn't have hash, eviction is not needed
             return False
 
         self._emit_block_removed_events(evicted_hashes)
+        if info is not None:
+            if self._pending_eviction is None:
+                # Direct invocation outside an attribution scope (e.g. tests
+                # or future callers driving the primitive manually). Attribute
+                # it as an explicit eviction rather than dropping the
+                # explanation.
+                self.eviction_events.append(
+                    EvictionEvent(
+                        reason=EVICTION_REASON_EXPLICIT,
+                        blocks=(info,),
+                        request_id=None,
+                    )
+                )
+            else:
+                self._pending_evicted_blocks[block.block_id] = info
         return True
 
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
@@ -773,13 +970,25 @@ class BlockPool:
         """Return whether a block can be mutated by its sole owner."""
         return not block.is_null and block.ref_cnt == 1 and block.block_hash is None
 
-    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+    def free_blocks(
+        self,
+        ordered_blocks: Iterable[KVCacheBlock],
+        request_id: str | None = None,
+    ) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
+
+        ``request_id`` is provenance only: each released block records it as
+        its ``last_request_id``, so when the block is later evicted from the
+        prefix cache the explanation can name the request that last held it.
+        Releasing a block never evicts anything by itself and therefore never
+        records an eviction event.
 
         Args:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
+            request_id: The request releasing the blocks, if attributable to a
+                single request.
 
         """
         # Identify blocks with hash (LRU cache) and without it (never match APC)
@@ -791,6 +1000,10 @@ class BlockPool:
                 other_pools.setdefault(block.pool, []).append(block)
                 continue
             block.ref_cnt -= 1
+            if request_id is not None:
+                # Stamp on every release; the final release (ref_cnt -> 0)
+                # leaves the ID of the last request that referenced the block.
+                block.last_request_id = request_id
             if block.ref_cnt == 0 and not block.is_null:
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
@@ -804,7 +1017,7 @@ class BlockPool:
         # Blocks to reuse last are appended to the end of the free queue.
         self.free_block_queue.append_n(blocks_to_evict_last)
         for pool, blocks in other_pools.items():
-            pool.free_blocks(blocks)
+            pool.free_blocks(blocks, request_id=request_id)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
@@ -813,18 +1026,28 @@ class BlockPool:
         with ref_cnt > 0 are not freed from the block pool, only evicted
         from the prefix cache hash table.
 
+        A single read-only :class:`EvictionEvent` with reason
+        ``explicit_eviction`` is recorded covering every block actually
+        evicted, naming each block's last referrer.
+
         Args:
             block_ids: Set of block IDs to evict from cache.
 
         """
-        for block_id in block_ids:
-            assert block_id < len(self.blocks), (
-                f"Invalid block_id {block_id} >= {len(self.blocks)}. "
-                f"This indicates a bug in the KV connector - workers should "
-                f"only report block IDs that were allocated by the scheduler."
-            )
-            block = self.blocks[block_id]
-            self._maybe_evict_cached_block(block)
+        assert self._pending_eviction is None
+        self._pending_eviction = (EVICTION_REASON_EXPLICIT, None)
+        self._pending_evicted_blocks = {}
+        try:
+            for block_id in block_ids:
+                assert block_id < len(self.blocks), (
+                    f"Invalid block_id {block_id} >= {len(self.blocks)}. "
+                    f"This indicates a bug in the KV connector - workers should "
+                    f"only report block IDs that were allocated by the scheduler."
+                )
+                block = self.blocks[block_id]
+                self._maybe_evict_cached_block(block)
+        finally:
+            self._finish_eviction_event()
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -836,6 +1059,11 @@ class BlockPool:
             False otherwise.
 
         """
+        # A reset is a deliberate bulk invalidation (and only succeeds when
+        # no request holds blocks), not capacity-driven eviction: it must not
+        # be confused with eviction explanations, so no EvictionEvent is
+        # recorded. The external KV-event stream receives AllBlocksCleared.
+        assert self._pending_eviction is None
         num_used_blocks = self.num_gpu_blocks - self.get_num_free_blocks()
         if num_used_blocks != 1:  # The null block is always marked as used
             logger.warning(
