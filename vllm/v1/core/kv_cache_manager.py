@@ -13,6 +13,7 @@ from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
 )
+from vllm.v1.core.kv_cache_eviction import KVCacheEvictionExplainer
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
@@ -159,6 +160,9 @@ class KVCacheManager:
         self.use_eagle = use_eagle
         self.log_stats = log_stats
         self.metrics_collector = metrics_collector
+        # Read-only observer of KV-cache evictions (what/why/last-reference).
+        # It never holds block objects, so it cannot pin freed blocks.
+        self.eviction_explainer = KVCacheEvictionExplainer()
         # FIXME: make prefix cache stats conditional on log_stats. We still need
         # this comment because when the log stats is enabled there are still
         # potential configs we could expose in the future.
@@ -177,6 +181,7 @@ class KVCacheManager:
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            eviction_explainer=self.eviction_explainer,
         )
         # One predicate, read by both sides of the feature, so the scheduler
         # cannot end a chunk at a junction the manager would refuse -- a refused
@@ -953,4 +958,19 @@ class KVCacheManager:
 
     def new_step_starts(self) -> None:
         """Notify the coordinator that a new step is starting."""
+        self.eviction_explainer.advance_step()
         self.coordinator.new_step_starts()
+
+    @property
+    def eviction_history(self) -> tuple:
+        """Read-only view of recorded KV-cache evictions, oldest first.
+
+        Each entry is a frozen ``EvictionRecord`` describing the reason, the
+        step, and the evicted blocks (with their last reference). The hit
+        path never produces entries here.
+        """
+        return self.eviction_explainer.history
+
+    def explain_evictions(self) -> str:
+        """Return a human-readable explanation of recent evictions."""
+        return self.eviction_explainer.explain()

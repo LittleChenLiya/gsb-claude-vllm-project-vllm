@@ -12,6 +12,10 @@ from vllm.distributed.kv_events import (
 )
 from vllm.logger import init_logger
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.v1.core.kv_cache_eviction import (
+    EvictionReason,
+    KVCacheEvictionExplainer,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -161,12 +165,15 @@ class BlockPool:
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
         medium: str = MEDIUM_GPU,
+        eviction_explainer: KVCacheEvictionExplainer | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
         self.medium = medium
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
+        # Read-only observer of evictions; never influences allocation.
+        self.eviction_explainer = eviction_explainer or KVCacheEvictionExplainer()
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx, pool=self) for idx in range(num_gpu_blocks)
@@ -291,11 +298,17 @@ class BlockPool:
                 )
                 removed_hashes = self._remove_cached_block_hashes(blk)
                 self._emit_block_removed_events(removed_hashes)
+                self.eviction_explainer.record_eviction(
+                    EvictionReason.HASH_REPLACED, [blk]
+                )
             self._insert_block_hash(
                 block_hash_with_group_id,
                 blk,
                 num_tokens=num_hash_tokens,
             )
+            # Record the last request that accessed this block (the one that
+            # cached it), so a later eviction can report its last reference.
+            self.eviction_explainer.note_reference(blk.block_id, request.request_id)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -523,6 +536,7 @@ class BlockPool:
             block,
             num_tokens=num_hash_blocks * self.hash_block_size,
         )
+        self.eviction_explainer.note_reference(block.block_id, request.request_id)
         if self.enable_kv_cache_events and not already_cached:
             parent_hash, block_start = self._get_partial_block_parent_hash_and_start(
                 request, num_tokens
@@ -687,12 +701,20 @@ class BlockPool:
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
+            evicted_blocks: list[KVCacheBlock] = []
             for block in ret:
-                self._maybe_evict_cached_block(block)
+                if self._maybe_evict_cached_block(block):
+                    evicted_blocks.append(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+            if evicted_blocks:
+                # Record a single read-only explanation for the whole batch.
+                # The hit path never reaches here, so cache hits stay silent.
+                self.eviction_explainer.record_eviction(
+                    EvictionReason.POOL_REUSE, evicted_blocks
+                )
         else:
             for block in ret:
                 assert block.ref_cnt == 0
@@ -728,16 +750,22 @@ class BlockPool:
                 released.append(block)
         self.free_block_queue.append_n(released)
 
-    def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
+    def _maybe_evict_cached_block(
+        self,
+        block: KVCacheBlock,
+    ) -> list:
         """If a block is cached in `cached_block_hash_to_block`, we reset its hash
         metadata and evict it from the cache.
+
+        This only performs the structural eviction; callers are responsible for
+        recording a read-only explanation via ``eviction_explainer``.
 
         Args:
             block: The block to evict.
 
         Returns:
-            True if the block is evicted, False otherwise.
-
+            The list of hash keys that were evicted (empty if the block had no
+            hash and nothing was evicted).
         """
         # Clean up metrics tracking first to prevent leaks
         if self.metrics_collector:
@@ -746,10 +774,10 @@ class BlockPool:
         evicted_hashes = self._remove_cached_block_hashes(block)
         if not evicted_hashes:
             # The block doesn't have hash, eviction is not needed
-            return False
+            return []
 
         self._emit_block_removed_events(evicted_hashes)
-        return True
+        return evicted_hashes
 
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
         """Touch a block increases its reference count by 1, and may remove
@@ -817,6 +845,7 @@ class BlockPool:
             block_ids: Set of block IDs to evict from cache.
 
         """
+        evicted_blocks: list[KVCacheBlock] = []
         for block_id in block_ids:
             assert block_id < len(self.blocks), (
                 f"Invalid block_id {block_id} >= {len(self.blocks)}. "
@@ -824,7 +853,12 @@ class BlockPool:
                 f"only report block IDs that were allocated by the scheduler."
             )
             block = self.blocks[block_id]
-            self._maybe_evict_cached_block(block)
+            if self._maybe_evict_cached_block(block):
+                evicted_blocks.append(block)
+        if evicted_blocks:
+            self.eviction_explainer.record_eviction(
+                EvictionReason.EXPLICIT, evicted_blocks
+            )
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -845,6 +879,9 @@ class BlockPool:
             )
             return False
 
+        # Snapshot the blocks that were still cached before we clear them.
+        evicted_blocks = [b for b in self.blocks if b.block_hash is not None]
+
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()
@@ -856,6 +893,11 @@ class BlockPool:
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
+
+        if evicted_blocks:
+            self.eviction_explainer.record_eviction(
+                EvictionReason.RESET, evicted_blocks
+            )
 
         if self.metrics_collector:
             self.metrics_collector.reset()

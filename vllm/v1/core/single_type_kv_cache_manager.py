@@ -10,6 +10,7 @@ from vllm.distributed.kv_events import MEDIUM_CPU
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_eviction import EvictionReason
 from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
     BlockHashListWithBlockSize,
@@ -300,6 +301,14 @@ class SingleTypeKVCacheManager(ABC):
         # Touch the computed blocks to make sure they won't be evicted.
         if self.enable_caching:
             self.block_pool.touch(new_computed_blocks)
+            # Record the last request that accessed these hit blocks, so a
+            # later eviction can report their last reference. The hit path
+            # itself never records an eviction.
+            for block in new_computed_blocks:
+                if not block.is_null:
+                    self.block_pool.eviction_explainer.note_reference(
+                        block.block_id, request_id
+                    )
         else:
             assert not any(new_computed_blocks), (
                 "Computed blocks should be empty when prefix caching is disabled"
@@ -358,6 +367,10 @@ class SingleTypeKVCacheManager(ABC):
         )
         allocated_blocks = self.block_pool.get_new_blocks(num_new_blocks)
         req_blocks.extend(allocated_blocks)
+        for block in allocated_blocks:
+            self.block_pool.eviction_explainer.note_reference(
+                block.block_id, request_id
+            )
         if self._record_new_block_ids:
             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
@@ -389,6 +402,9 @@ class SingleTypeKVCacheManager(ABC):
             cow_block = self.block_pool.get_new_blocks(1)[0]
             self._apply_cow(request_id, block_idx, source_block, cow_block)
             self.new_block_ids.append(cow_block.block_id)
+            self.block_pool.eviction_explainer.note_reference(
+                cow_block.block_id, request_id
+            )
             cow_blocks.append(cow_block)
 
         req_blocks = self.req_to_blocks[request_id]
@@ -399,6 +415,10 @@ class SingleTypeKVCacheManager(ABC):
         else:
             new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
             req_blocks.extend(new_blocks)
+            for block in new_blocks:
+                self.block_pool.eviction_explainer.note_reference(
+                    block.block_id, request_id
+                )
             if self._record_new_block_ids:
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             return cow_blocks + new_blocks
@@ -524,6 +544,15 @@ class SingleTypeKVCacheManager(ABC):
             kv_cache_group_id=self.kv_cache_group_id,
             block_mask=block_mask,
         )
+        # Record the last request that accessed the newly cached blocks, so a
+        # later eviction can report their last reference.
+        for block in self.req_to_blocks[request.request_id][
+            num_cached_blocks:num_full_blocks
+        ]:
+            if not block.is_null:
+                self.block_pool.eviction_explainer.note_reference(
+                    block.block_id, request.request_id
+                )
 
         self.num_cached_block[request.request_id] = num_full_blocks
 
@@ -2051,7 +2080,10 @@ class MambaManager(SingleTypeKVCacheManager):
                 # request-local. The slot may carry a hash from this step's
                 # full-block pass; that must go too, since the checkpoint
                 # state is about to overwrite the block.
-                self.block_pool._maybe_evict_cached_block(checkpoint_block)
+                if self.block_pool._maybe_evict_cached_block(checkpoint_block):
+                    self.block_pool.eviction_explainer.record_eviction(
+                        EvictionReason.HASH_REPLACED, [checkpoint_block]
+                    )
                 return None
             if checkpoint_block.block_hash_num_tokens == checkpoint_position:
                 return None
