@@ -5,6 +5,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
+from enum import Enum
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -74,6 +75,26 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+class QueuingReason(Enum):
+    """The reason a request is currently queued (not scheduled).
+
+    This is a diagnostic categorization exposed by
+    :meth:`Scheduler.get_queuing_reason_snapshot`. It distinguishes the three
+    high-level causes that prevent a waiting request from being admitted:
+
+    - ``TOKEN_BUDGET``: the per-step token budget
+      (``max_num_scheduled_tokens`` / ``max_num_batched_tokens``) is exhausted.
+    - ``KV_CAPACITY``: the KV cache cannot allocate blocks for the request
+      (``allocate_slots`` returned ``None``).
+    - ``PRIORITY``: the request is preempted (in a priority-scheduled system it
+      was the lowest-priority victim) or is held back by priority ordering.
+    """
+
+    TOKEN_BUDGET = "token_budget"
+    KV_CAPACITY = "kv_capacity"
+    PRIORITY = "priority"
 
 
 class Scheduler(SchedulerInterface):
@@ -213,6 +234,12 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+
+        # Read-only queuing-reason snapshot: request_id -> reason the request
+        # is currently queued (not scheduled). Rebuilt each schedule() call and
+        # kept consistent on cancellation/finish. Reading it never mutates the
+        # queues or the scheduling order.
+        self._queuing_reasons: dict[str, QueuingReason] = {}
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -556,6 +583,10 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        # Rebuild the queuing-reason snapshot for this step. It is repopulated
+        # below as requests are preempted or the waiting loop stops making
+        # progress; reading it never mutates the queues.
+        self._queuing_reasons.clear()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -770,6 +801,15 @@ class Scheduler(SchedulerInterface):
                     if not self._request_blocks_can_be_freed(preempted_req):
                         break
 
+                    # Record why the victim ends up queued: in a priority
+                    # system it is the lowest-priority running request;
+                    # otherwise (FCFS) it is preempted to free KV blocks.
+                    self._queuing_reasons[preempted_req.request_id] = (
+                        QueuingReason.PRIORITY
+                        if self.policy == SchedulingPolicy.PRIORITY
+                        else QueuingReason.KV_CAPACITY
+                    )
+
                     if self.policy == SchedulingPolicy.PRIORITY:
                         victim_index = self.running.index(preempted_req)
                         del self.running[victim_index]
@@ -868,9 +908,14 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
+            # Why the waiting loop stopped making progress this step. Applied
+            # to every still-queued request that does not already carry a more
+            # specific reason (e.g. a preempted victim).
+            waiting_block_reason: QueuingReason | None = None
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if input_budget <= draft_slots:
+                    waiting_block_reason = QueuingReason.TOKEN_BUDGET
                     break
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
@@ -1108,6 +1153,7 @@ class Scheduler(SchedulerInterface):
                         ):
                             if padded_num_tokens > request_token_budget:
                                 # Prefer to not schedule than schedule un-padded.
+                                waiting_block_reason = QueuingReason.TOKEN_BUDGET
                                 break
                             num_new_tokens = padded_num_tokens
                             pad_spec_decode = True
@@ -1123,6 +1169,7 @@ class Scheduler(SchedulerInterface):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        waiting_block_reason = QueuingReason.TOKEN_BUDGET
                         break
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
@@ -1174,6 +1221,7 @@ class Scheduler(SchedulerInterface):
 
                     if num_new_tokens == 0:
                         # The request cannot be scheduled.
+                        waiting_block_reason = QueuingReason.TOKEN_BUDGET
                         break
 
                 # During async KV load, no forward pass is run yet.
@@ -1227,6 +1275,7 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    waiting_block_reason = QueuingReason.KV_CAPACITY
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -1261,6 +1310,8 @@ class Scheduler(SchedulerInterface):
                     )
 
                 request = request_queue.pop_request()
+                # Admitted: no longer queued, drop its reason from the snapshot.
+                self._queuing_reasons.pop(request_id, None)
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -1345,6 +1396,24 @@ class Scheduler(SchedulerInterface):
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
+
+            # If the loop ran out of token budget (rather than breaking on a
+            # specific request), attribute that to every still-queued request
+            # that does not already carry a more specific reason.
+            if (
+                waiting_block_reason is None
+                and token_budget <= 0
+                and (self.waiting or self.skipped_waiting)
+            ):
+                waiting_block_reason = QueuingReason.TOKEN_BUDGET
+
+            if waiting_block_reason is not None:
+                for queued_req in itertools.chain(
+                    self.waiting, self.skipped_waiting
+                ):
+                    self._queuing_reasons.setdefault(
+                        queued_req.request_id, waiting_block_reason
+                    )
 
             # DP prefill balancing: on a step that admitted prefills (release),
             # record whether it was capacity-bound.
@@ -2533,6 +2602,16 @@ class Scheduler(SchedulerInterface):
         """Returns the fraction of the KV cache currently in use (0.0-1.0)."""
         return self.kv_cache_manager.usage
 
+    def get_queuing_reason_snapshot(self) -> dict[str, QueuingReason]:
+        """Return a read-only snapshot of the queuing reasons.
+
+        Maps request IDs to the :class:`QueuingReason` the request is currently
+        queued (not scheduled). The snapshot is a plain copy; mutating it does
+        not affect the scheduler, and reading it never changes the queuing
+        order. Cancelled/finished requests are removed from the snapshot.
+        """
+        return dict(self._queuing_reasons)
+
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
         if existing is not None:
@@ -2610,6 +2689,10 @@ class Scheduler(SchedulerInterface):
             self.waiting.remove_requests(waiting_requests_to_remove)
             self.skipped_waiting.remove_requests(waiting_requests_to_remove)
 
+        # Cancelled/aborted requests must not linger in the queuing snapshot.
+        for request in valid_requests:
+            self._queuing_reasons.pop(request.request_id, None)
+
         # Second pass: set status and free requests
         for request in valid_requests:
             delay_free_blocks = False
@@ -2633,6 +2716,8 @@ class Scheduler(SchedulerInterface):
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
         self._inflight_prefills.discard(request)
+        # A finishing request is no longer queued; drop any stale reason.
+        self._queuing_reasons.pop(request.request_id, None)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing
