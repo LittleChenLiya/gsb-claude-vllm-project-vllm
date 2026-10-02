@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import enum
+import heapq
 import itertools
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -74,6 +76,37 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+class QueuedReason(enum.Enum):
+    """Why a request remains in the waiting queue after a scheduling step.
+
+    - TOKEN_BUDGET: the per-step token/input budget (max_num_batched_tokens /
+      max_num_scheduled_tokens) was exhausted by requests ahead of this one.
+    - KV_CAPACITY: the KV cache manager could not allocate the blocks this
+      request needs (or a running request had to be preempted this step).
+    - PRIORITY: the request is waiting behind others under the active
+      scheduling policy, e.g. no active request slot was free or the queue
+      head itself is deferred.
+    """
+
+    TOKEN_BUDGET = "token_budget"
+    KV_CAPACITY = "kv_capacity"
+    PRIORITY = "priority"
+
+
+@dataclass(frozen=True)
+class QueuedRequestSnapshot:
+    """Read-only snapshot of one request that stayed queued.
+
+    The fields are immutable copies captured at schedule() time; the snapshot
+    never holds a mutable view that could perturb the request or the queue.
+    """
+
+    request_id: str
+    reason: QueuedReason
+    priority: int
+    arrival_time: float
 
 
 class Scheduler(SchedulerInterface):
@@ -406,6 +439,10 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+        # Read-only snapshot of why each waiting request stayed queued after
+        # the most recent schedule() step. Empty tuple before the first step.
+        self._queued_reason_snapshot: tuple[QueuedRequestSnapshot, ...] = ()
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -532,6 +569,50 @@ class Scheduler(SchedulerInterface):
             self.kv_cache_manager.get_computed_blocks(request)
         )
         return blocks, num_local, shared_prefix_boundary, False
+
+    def _build_queued_reason_snapshot(
+        self, head_reason: QueuedReason
+    ) -> tuple[QueuedRequestSnapshot, ...]:
+        """Freeze why requests remain queued after this scheduling step.
+
+        The queue head carries ``head_reason`` (the constraint the scheduler
+        actually hit); every request behind it is recorded as waiting on
+        ``QueuedReason.PRIORITY``. The iteration mirrors
+        ``_select_waiting_queue_for_scheduling`` and is non-mutating.
+        """
+        if self.skipped_waiting:
+            if self.policy == SchedulingPolicy.PRIORITY and self.waiting:
+                queued = heapq.merge(self.skipped_waiting, self.waiting)
+            else:
+                # FCFS: the skipped queue is always drained before `waiting`.
+                queued = itertools.chain(self.skipped_waiting, self.waiting)
+        else:
+            queued = iter(self.waiting)
+
+        snapshots: list[QueuedRequestSnapshot] = []
+        for request in queued:
+            # Defensive: a request cancelled between queue re-queueing and the
+            # snapshot must never be reported as queued.
+            if request.request_id not in self.requests or request.is_finished():
+                continue
+            snapshots.append(
+                QueuedRequestSnapshot(
+                    request_id=request.request_id,
+                    reason=(head_reason if not snapshots else QueuedReason.PRIORITY),
+                    priority=request.priority,
+                    arrival_time=request.arrival_time,
+                )
+            )
+        return tuple(snapshots)
+
+    def get_queued_reason_snapshot(self) -> tuple[QueuedRequestSnapshot, ...]:
+        """Read-only snapshot of requests still queued after the last step.
+
+        Returns an immutable tuple ordered exactly like the waiting queue;
+        taking it never changes queue order or scheduler state. Cancelled
+        requests are never present (they are pruned synchronously on abort).
+        """
+        return self._queued_reason_snapshot
 
     def _reserve_prefill_lookahead(
         self,
@@ -866,6 +947,10 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
+        # Read-only observability: the queued-head reason, captured only if the
+        # waiting loop stops for an external constraint. This never changes the
+        # scheduling decisions below; requests are only popped/re-queued.
+        queued_head_reason: QueuedReason | None = None
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
 
@@ -876,6 +961,8 @@ class Scheduler(SchedulerInterface):
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_active_reqs:
+                    # No active slot: later requests are queued by policy.
+                    queued_head_reason = QueuedReason.PRIORITY
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -1073,6 +1160,7 @@ class Scheduler(SchedulerInterface):
                 elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
                     # DP prefill balancing: defer this step's local prefill
                     # compute to a cadence-aligned step.
+                    queued_head_reason = QueuedReason.PRIORITY
                     break
                 else:
                     request_token_budget = min(token_budget, input_budget - draft_slots)
@@ -1108,6 +1196,7 @@ class Scheduler(SchedulerInterface):
                         ):
                             if padded_num_tokens > request_token_budget:
                                 # Prefer to not schedule than schedule un-padded.
+                                queued_head_reason = QueuedReason.TOKEN_BUDGET
                                 break
                             num_new_tokens = padded_num_tokens
                             pad_spec_decode = True
@@ -1123,6 +1212,7 @@ class Scheduler(SchedulerInterface):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        queued_head_reason = QueuedReason.TOKEN_BUDGET
                         break
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
@@ -1137,6 +1227,9 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens,
                         )
                         if num_new_tokens == 0:
+                            # Aligned chunk does not fit the per-step token
+                            # budget.
+                            queued_head_reason = QueuedReason.TOKEN_BUDGET
                             break
                         if (
                             pad_spec_decode
@@ -1173,7 +1266,9 @@ class Scheduler(SchedulerInterface):
                     )
 
                     if num_new_tokens == 0:
-                        # The request cannot be scheduled.
+                        # The request cannot be scheduled (e.g. encoder budget
+                        # or prefill-lookahead exhausted).
+                        queued_head_reason = QueuedReason.TOKEN_BUDGET
                         break
 
                 # During async KV load, no forward pass is run yet.
@@ -1232,6 +1327,7 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    queued_head_reason = QueuedReason.KV_CAPACITY
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1350,6 +1446,30 @@ class Scheduler(SchedulerInterface):
             # record whether it was capacity-bound.
             if not defer_prefills:
                 self.prefill_capacity_bound = bool(self.waiting)
+
+            # The waiting loop ran. If it did not stop on KV capacity or an
+            # active-slot/policy limit, any still-queued request is blocked by
+            # the remaining per-step token budget (including when the loop
+            # naturally drained it), or by policy when the queue is simply
+            # empty for this request (budget fully available).
+            if queued_head_reason is None:
+                if token_budget <= 0 or input_budget <= draft_slots:
+                    queued_head_reason = QueuedReason.TOKEN_BUDGET
+                else:
+                    queued_head_reason = QueuedReason.PRIORITY
+        elif preempted_reqs:
+            # WAITING requests were not even examined because a running request
+            # had to be preempted for KV blocks: KV capacity is the blocker.
+            queued_head_reason = QueuedReason.KV_CAPACITY
+        else:
+            # Scheduler is paused; no WAITING requests were considered.
+            queued_head_reason = QueuedReason.PRIORITY
+
+        # Build the read-only queued-reason snapshot. This iterates the queues
+        # in scheduling order without mutating them, so queue order is intact.
+        self._queued_reason_snapshot = self._build_queued_reason_snapshot(
+            queued_head_reason
+        )
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -2609,6 +2729,16 @@ class Scheduler(SchedulerInterface):
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
             self.skipped_waiting.remove_requests(waiting_requests_to_remove)
+
+        # A cancelled request must never linger in the read-only snapshot,
+        # even before the next schedule() refreshes it.
+        if valid_requests and self._queued_reason_snapshot:
+            cancelled_ids = {req.request_id for req in valid_requests}
+            self._queued_reason_snapshot = tuple(
+                snap
+                for snap in self._queued_reason_snapshot
+                if snap.request_id not in cancelled_ids
+            )
 
         # Second pass: set status and free requests
         for request in valid_requests:
