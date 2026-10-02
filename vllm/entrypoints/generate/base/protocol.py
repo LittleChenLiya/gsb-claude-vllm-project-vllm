@@ -266,6 +266,10 @@ def validate_structured_outputs_structural_tag(
 class StreamOptions(OpenAIBaseModel):
     include_usage: bool | None = False
     continuous_usage_stats: bool | None = False
+    # Opt-in to a termination reason event immediately before the terminal
+    # ``data: [DONE]`` frame. Defaults to False so the stream's wire format is
+    # unchanged. See ``vllm.entrypoints.serve.utils.stream_termination``.
+    include_termination_reason: bool | None = False
 
 
 class FunctionDefinition(OpenAIBaseModel):

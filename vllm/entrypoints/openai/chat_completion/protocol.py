@@ -179,6 +179,10 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     # ``return_prompt_text=True`` on the request); only sent on the first chunk.
     prompt_text: str | None = None
     metrics: PerRequestMetrics | None = None
+    # Optional termination reason for the stream. Only set on the terminal
+    # event (before ``[DONE]``) when ``stream_options.include_termination_reason``
+    # is enabled; otherwise absent so the default schema is unchanged.
+    termination_reason: str | None = None
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):

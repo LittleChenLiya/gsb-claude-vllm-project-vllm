@@ -688,3 +688,7 @@ class CompletionStreamResponse(OpenAIBaseModel):
     # without the per-chunk serialization overhead.
     system_fingerprint: str | None = None
     metrics: PerRequestMetrics | None = None
+    # Optional termination reason for the stream. Only set on the terminal
+    # event (before ``[DONE]``) when ``stream_options.include_termination_reason``
+    # is enabled; otherwise absent so the default schema is unchanged.
+    termination_reason: str | None = None

@@ -5,7 +5,7 @@
 from http import HTTPStatus
 
 from fastapi import APIRouter, Depends, FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from vllm.entrypoints.openai.completion.protocol import (
     CompletionRequest,
@@ -20,6 +20,10 @@ from vllm.entrypoints.serve.utils.api_utils import (
 )
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.sse_keep_alive import with_sse_keep_alive
+from vllm.entrypoints.serve.utils.stream_termination import (
+    TerminationStreamingResponse,
+    with_stream_termination,
+)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -66,8 +70,20 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 
     args = getattr(raw_request.app.state, "args", None)
     keep_alive_interval = getattr(args, "sse_keep_alive_interval", 0)
-    return StreamingResponse(
-        content=with_sse_keep_alive(generator, float(keep_alive_interval)),
+    stream_termination_timeout = getattr(args, "stream_termination_timeout", 0) or 0
+    include_termination_reason = bool(
+        request.stream_options and request.stream_options.include_termination_reason
+    )
+    generator = with_stream_termination(
+        with_sse_keep_alive(generator, float(keep_alive_interval)),
+        include_termination_reason=include_termination_reason,
+        timeout=float(stream_termination_timeout),
+        on_termination=lambda reason: setattr(
+            raw_request.state, "termination_reason", reason
+        ),
+    )
+    return TerminationStreamingResponse(
+        content=generator,
         media_type="text/event-stream",
     )
 
